@@ -1,42 +1,51 @@
+import json
 import time
-import requests
 import pandas as pd
 import pandas_ta as ta
 import streamlit as st
+import websocket
+import threading
 
 # -----------------------------
 # Config
 # -----------------------------
 ASSETS = [
-    {"symbol": "ETHUSDT", "label": "Ethereum", "id": "ethereum"},
-    {"symbol": "SOLUSDT", "label": "Solana", "id": "solana"},
-    {"symbol": "XRPUSDT", "label": "XRP", "id": "xrp"},
-    {"symbol": "ZECUSDT", "label": "Zcash", "id": "zcash"},
+    {"symbol": "ethusdt", "label": "Ethereum"},
+    {"symbol": "solusdt", "label": "Solana"},
+    {"symbol": "xrpusdt", "label": "XRP"},
+    {"symbol": "zecusdt", "label": "Zcash"},
 ]
 
-# CoinCap intervals: m1, m5, m15, m30, h1, h2, h6, h12, d1
-DEFAULT_INTERVAL = "m15"
+# Global storage for live prices
+price_buffers = {a["symbol"]: [] for a in ASSETS}
 
 # -----------------------------
-# Data fetch from CoinCap
+# WebSocket handler
 # -----------------------------
-def fetch_klines(asset_id: str, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
-    url = f"https://api.coincap.io/v2/assets/{asset_id}/history"
-    params = {"interval": interval}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        raw = r.json()
-    except Exception as e:
-        st.error(f"Failed to fetch data for {asset_id}: {e}")
-        return pd.DataFrame()
+def on_message(ws, message):
+    data = json.loads(message)
+    symbol = data.get("s", "").lower()
+    price = float(data.get("p", 0))
+    ts = pd.to_datetime(data.get("T"), unit="ms")
+    if symbol in price_buffers:
+        price_buffers[symbol].append({"time": ts, "close": price})
+        # keep only last 500 points
+        price_buffers[symbol] = price_buffers[symbol][-500:]
 
-    # CoinCap returns list of {priceUsd, time, date}
-    data = raw.get("data", [])
-    df = pd.DataFrame(data)
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df["close"] = df["priceUsd"].astype(float)
-    return df
+def on_error(ws, error):
+    print("WebSocket error:", error)
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket closed")
+
+def run_socket():
+    streams = "/".join([f"{a['symbol']}@trade" for a in ASSETS])
+    url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws.run_forever()
+
+# Start WebSocket in background thread
+threading.Thread(target=run_socket, daemon=True).start()
 
 # -----------------------------
 # Indicators
@@ -49,13 +58,10 @@ def compute_indicators(df: pd.DataFrame):
     df["macd"] = macd["MACD_12_26_9"]
     df["macd_signal"] = macd["MACDs_12_26_9"]
     df["macd_hist"] = macd["MACDh_12_26_9"]
-    # PSAR normally needs high/low, but CoinCap only gives close → use trailing close as placeholder
+    # PSAR placeholder (since we only have close)
     df["psar"] = df["close"].shift(1)
     return df
 
-# -----------------------------
-# Confirmation bundle
-# -----------------------------
 def confirmation_bundle(df: pd.DataFrame):
     if df.empty:
         return {}
@@ -64,63 +70,4 @@ def confirmation_bundle(df: pd.DataFrame):
     rsi = latest["rsi"]
 
     macd_cross_up = (prev["macd"] < prev["macd_signal"]) and (latest["macd"] > latest["macd_signal"])
-    macd_cross_down = (prev["macd"] > prev["macd_signal"]) and (latest["macd"] < latest["macd_signal"])
-    price_above_psar = latest["close"] > latest["psar"]
-    price_below_psar = latest["close"] < latest["psar"]
-
-    buy_ok = (pd.notna(rsi) and rsi < 40) and macd_cross_up and price_above_psar
-    sell_ok = (pd.notna(rsi) and rsi > 60) and macd_cross_down and price_below_psar
-
-    return {
-        "price": float(latest["close"]),
-        "time": latest["time"],
-        "rsi": float(rsi) if pd.notna(rsi) else None,
-        "macd": float(latest["macd"]) if pd.notna(latest["macd"]) else None,
-        "macd_signal": float(latest["macd_signal"]) if pd.notna(latest["macd_signal"]) else None,
-        "macd_hist": float(latest["macd_hist"]) if pd.notna(latest["macd_hist"]) else None,
-        "psar": float(latest["psar"]) if pd.notna(latest["psar"]) else None,
-        "buy_ok": buy_ok,
-        "sell_ok": sell_ok,
-    }
-
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title="Multi-Asset Trading Assistant", layout="wide")
-st.title("Multi-Asset Trading Assistant (ETH, SOL, XRP, ZEC)")
-
-interval = st.sidebar.selectbox(
-    "Interval",
-    ["m1","m5","m15","m30","h1","h2","h6","h12","d1"],
-    index=2
-)
-refresh_sec = st.sidebar.slider("Auto-refresh seconds", 0, 120, 0)
-show_tables = st.sidebar.checkbox("Show raw data tables", False)
-
-cols = st.columns(2)
-for i, asset in enumerate(ASSETS):
-    with cols[i % 2]:
-        st.markdown(f"### {asset['label']} ({asset['symbol']})")
-        df = fetch_klines(asset["id"], interval=interval)
-        df = compute_indicators(df)
-        bundle = confirmation_bundle(df)
-
-        if not bundle:
-            st.warning("No data available")
-            continue
-
-        st.metric("Price (USD)", f"{bundle['price']:.4f}")
-        st.write(f"RSI: {bundle['rsi']:.2f} | MACD: {bundle['macd']:.4f} | Signal: {bundle['macd_signal']:.4f} | Hist: {bundle['macd_hist']:.4f}")
-
-        st.success("BUY conditions met") if bundle["buy_ok"] else st.info("Buy not confirmed")
-        st.error("SELL conditions met") if bundle["sell_ok"] else st.info("Sell not confirmed")
-
-        st.line_chart(df[["close","psar"]].set_index(df["time"]))
-
-        if show_tables:
-            st.dataframe(df.tail(50))
-
-if refresh_sec > 0:
-    st.caption(f"Auto-refreshing every {refresh_sec} seconds…")
-    time.sleep(refresh_sec)
-    st.experimental_rerun()
+    macd_cross_down = (prev["macd"] > prev["macd_signal"])
