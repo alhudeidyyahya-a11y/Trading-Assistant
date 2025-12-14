@@ -10,19 +10,19 @@ import streamlit as st
 ASSETS = [
     {"symbol": "ETHUSDT", "label": "Ethereum", "id": "ethereum"},
     {"symbol": "SOLUSDT", "label": "Solana", "id": "solana"},
-    {"symbol": "XRPUSDT", "label": "XRP", "id": "ripple"},
+    {"symbol": "XRPUSDT", "label": "XRP", "id": "xrp"},
     {"symbol": "ZECUSDT", "label": "Zcash", "id": "zcash"},
 ]
 
-DEFAULT_INTERVAL = "minute"  # CoinGecko supports: 'minute', 'hourly', 'daily'
-DAYS = "1"  # how many days of data to fetch
+# CoinCap intervals: m1, m5, m15, m30, h1, h2, h6, h12, d1
+DEFAULT_INTERVAL = "m15"
 
 # -----------------------------
-# Data fetch from CoinGecko
+# Data fetch from CoinCap
 # -----------------------------
-def fetch_klines(asset_id: str, interval: str = DEFAULT_INTERVAL, days: str = DAYS) -> pd.DataFrame:
-    url = f"https://api.coingecko.com/api/v3/coins/{asset_id}/market_chart"
-    params = {"vs_currency": "usd", "days": days, "interval": interval}
+def fetch_klines(asset_id: str, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
+    url = f"https://api.coincap.io/v2/assets/{asset_id}/history"
+    params = {"interval": interval}
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
@@ -31,10 +31,11 @@ def fetch_klines(asset_id: str, interval: str = DEFAULT_INTERVAL, days: str = DA
         st.error(f"Failed to fetch data for {asset_id}: {e}")
         return pd.DataFrame()
 
-    # CoinGecko returns [timestamp, price]
-    prices = raw.get("prices", [])
-    df = pd.DataFrame(prices, columns=["time", "close"])
+    # CoinCap returns list of {priceUsd, time, date}
+    data = raw.get("data", [])
+    df = pd.DataFrame(data)
     df["time"] = pd.to_datetime(df["time"], unit="ms")
+    df["close"] = df["priceUsd"].astype(float)
     return df
 
 # -----------------------------
@@ -48,7 +49,7 @@ def compute_indicators(df: pd.DataFrame):
     df["macd"] = macd["MACD_12_26_9"]
     df["macd_signal"] = macd["MACDs_12_26_9"]
     df["macd_hist"] = macd["MACDh_12_26_9"]
-    # PSAR normally needs high/low, but we only have close → use trailing close as placeholder
+    # PSAR normally needs high/low, but CoinCap only gives close → use trailing close as placeholder
     df["psar"] = df["close"].shift(1)
     return df
 
@@ -88,8 +89,11 @@ def confirmation_bundle(df: pd.DataFrame):
 st.set_page_config(page_title="Multi-Asset Trading Assistant", layout="wide")
 st.title("Multi-Asset Trading Assistant (ETH, SOL, XRP, ZEC)")
 
-interval = st.sidebar.selectbox("Interval", ["minute","hourly","daily"], index=0)
-days = st.sidebar.selectbox("Days of history", ["1","7","30"], index=0)
+interval = st.sidebar.selectbox(
+    "Interval",
+    ["m1","m5","m15","m30","h1","h2","h6","h12","d1"],
+    index=2
+)
 refresh_sec = st.sidebar.slider("Auto-refresh seconds", 0, 120, 0)
 show_tables = st.sidebar.checkbox("Show raw data tables", False)
 
@@ -97,7 +101,7 @@ cols = st.columns(2)
 for i, asset in enumerate(ASSETS):
     with cols[i % 2]:
         st.markdown(f"### {asset['label']} ({asset['symbol']})")
-        df = fetch_klines(asset["id"], interval=interval, days=days)
+        df = fetch_klines(asset["id"], interval=interval)
         df = compute_indicators(df)
         bundle = confirmation_bundle(df)
 
